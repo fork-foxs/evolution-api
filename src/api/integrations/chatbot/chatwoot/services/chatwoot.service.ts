@@ -1512,6 +1512,50 @@ export class ChatwootService {
           formatText = textToConcat.join(formattedDelimiter);
         }
 
+        // Chatwoot interactive messages → WhatsApp interactive messages.
+        // (Private notes are already filtered upstream in receiveWebhook,
+        // so only public messages reach this point — no duplicates.)
+        const cwContentType = (body as any).content_type;
+        const cwItems = (body as any).content_attributes?.items;
+
+        // input_select → WhatsApp list (WhatsApp allows max 10 rows).
+        if (cwContentType === 'input_select' && Array.isArray(cwItems) && cwItems.length > 0) {
+          const rows = cwItems.slice(0, 10).map((item: any) => ({
+            title: String(item?.title || '').slice(0, 24),
+            description: String(item?.description || ''),
+            rowId: String(item?.value ?? item?.title ?? ''),
+          }));
+          await waInstance?.listMessage({
+            number: chatId,
+            title: 'Options',
+            description: messageReceived || '',
+            buttonText: 'Select an option',
+            sections: [{ title: 'Options', rows }],
+          } as any);
+          return { message: 'bot' };
+        }
+
+        // cards with postback actions → WhatsApp reply buttons (max 3).
+        if (cwContentType === 'cards' && Array.isArray(cwItems) && cwItems.length > 0) {
+          const replies = ((cwItems[0] as any)?.actions || [])
+            .filter((action: any) => action?.type === 'postback')
+            .slice(0, 3)
+            .map((action: any) => ({
+              type: 'reply',
+              id: String(action?.payload || action?.text || ''),
+              displayText: String(action?.text || '').slice(0, 20),
+            }));
+          if (replies.length > 0) {
+            await waInstance?.buttonMessage({
+              number: chatId,
+              title: messageReceived || '',
+              description: String((cwItems[0] as any)?.description || ''),
+              buttons: replies,
+            } as any);
+            return { message: 'bot' };
+          }
+        }
+
         for (const message of body.conversation.messages) {
           if (message.attachments && message.attachments.length > 0) {
             for (const attachment of message.attachments) {
@@ -2194,12 +2238,17 @@ export class ChatwootService {
         }
 
         const originalMessage = await this.getConversationMessage(body.message);
-        const bodyMessage = originalMessage
-          ? originalMessage
-              .replaceAll(/\*((?!\s)([^\n*]+?)(?<!\s))\*/g, '**$1**')
-              .replaceAll(/_((?!\s)([^\n_]+?)(?<!\s))_/g, '*$1*')
-              .replaceAll(/~((?!\s)([^\n~]+?)(?<!\s))~/g, '~~$1~~')
-          : originalMessage;
+        // List messages carry machine-readable rowIds (e.g. send_activation_code)
+        // that WhatsApp→Chatwoot markdown conversion would corrupt
+        // (_activation_ → *activation*). Skip conversion for list payloads.
+        const isListPayload = body?.messageType === 'listResponseMessage' || body?.messageType === 'listMessage';
+        const bodyMessage =
+          originalMessage && !isListPayload
+            ? originalMessage
+                .replaceAll(/\*((?!\s)([^\n*]+?)(?<!\s))\*/g, '**$1**')
+                .replaceAll(/_((?!\s)([^\n_]+?)(?<!\s))_/g, '*$1*')
+                .replaceAll(/~((?!\s)([^\n~]+?)(?<!\s))~/g, '~~$1~~')
+            : originalMessage;
 
         if (bodyMessage && bodyMessage.includes('/survey/responses/') && bodyMessage.includes('http')) {
           return;
