@@ -3,6 +3,8 @@ import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/d
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { getInteractiveReply, getReplyContext } from '@api/integrations/chatbot/chatwoot/utils/interactive-reply';
+import { formatChatwootList } from '@api/integrations/chatbot/chatwoot/utils/list-message';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -48,6 +50,14 @@ export class ChatwootService {
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
 
   private provider: any;
+
+  // Cache para deduplicação de orderMessage (evita mensagens duplicadas)
+  private processedOrderIds: Map<string, number> = new Map();
+  private readonly ORDER_CACHE_TTL_MS = 30000; // 30 segundos
+
+  // Cache para mapeamento LID → Número Normal (resolve problema de @lid)
+  private lidToPhoneMap: Map<string, { phone: string; timestamp: number }> = new Map();
+  private readonly LID_CACHE_TTL_MS = 3600000; // 1 hora
 
   constructor(
     private readonly waMonitor: WAMonitoringService,
@@ -632,10 +642,32 @@ export class ChatwootService {
   public async createConversation(instance: InstanceDto, body: any) {
     const isLid = body.key.addressingMode === 'lid';
     const isGroup = body.key.remoteJid.endsWith('@g.us');
-    const phoneNumber = isLid && !isGroup ? body.key.remoteJidAlt : body.key.remoteJid;
+    let phoneNumber = isLid && !isGroup ? body.key.remoteJidAlt : body.key.remoteJid;
     const { remoteJid } = body.key;
-    const cacheKey = `${instance.instanceName}:createConversation-${remoteJid}`;
-    const lockKey = `${instance.instanceName}:lock:createConversation-${remoteJid}`;
+
+    // CORREÇÃO LID: Resolve LID para número normal antes de processar
+    if (isLid && !isGroup) {
+      const resolvedPhone = await this.resolveLidToPhone(instance, body.key);
+
+      if (resolvedPhone && resolvedPhone !== remoteJid) {
+        this.logger.verbose(`LID detected and resolved: ${remoteJid} → ${resolvedPhone}`);
+        phoneNumber = resolvedPhone;
+
+        // Salva mapeamento se temos remoteJidAlt
+        if (body.key.remoteJidAlt) {
+          this.saveLidMapping(remoteJid, body.key.remoteJidAlt);
+        }
+      } else if (body.key.remoteJidAlt) {
+        // Se não resolveu mas tem remoteJidAlt, usa ele
+        phoneNumber = body.key.remoteJidAlt;
+        this.saveLidMapping(remoteJid, body.key.remoteJidAlt);
+        this.logger.verbose(`Using remoteJidAlt for LID: ${remoteJid} → ${phoneNumber}`);
+      }
+    }
+
+    // Usa phoneNumber como base para cache (não o LID)
+    const cacheKey = `${instance.instanceName}:createConversation-${phoneNumber}`;
+    const lockKey = `${instance.instanceName}:lock:createConversation-${phoneNumber}`;
     const maxWaitTime = 5000; // 5 seconds
     const client = await this.clientCw(instance);
     if (!client) return null;
@@ -943,20 +975,44 @@ export class ChatwootService {
 
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
 
+    // Filtra valores null/undefined do content_attributes para evitar erro 406
+    const filteredReplyToIds: Record<string, unknown> = Object.fromEntries(
+      Object.entries(replyToIds).filter(([, value]) => value != null),
+    );
+    const interactiveReply = getInteractiveReply(messageBody?.message);
+    if (interactiveReply) {
+      // Display the label, while preserving the exact selection for the Agent Bot.
+      filteredReplyToIds.interactive_reply = interactiveReply;
+    }
+
+    // Monta o objeto data, incluindo content_attributes apenas se houver dados válidos
+    const messageData: any = {
+      content: content,
+      message_type: messageType,
+      content_type: 'text', // Explicitamente define como texto para Chatwoot 4.x
+      attachments: attachments,
+      private: privateMessage || false,
+    };
+
+    // Adiciona source_id apenas se existir
+    if (sourceId) {
+      messageData.source_id = sourceId;
+    }
+
+    // Adiciona content_attributes apenas se houver dados válidos
+    if (Object.keys(filteredReplyToIds).length > 0) {
+      messageData.content_attributes = filteredReplyToIds;
+    }
+
+    // Adiciona source_reply_id apenas se existir
+    if (sourceReplyId) {
+      messageData.source_reply_id = sourceReplyId.toString();
+    }
+
     const message = await client.messages.create({
       accountId: this.provider.accountId,
       conversationId: conversationId,
-      data: {
-        content: content,
-        message_type: messageType,
-        attachments: attachments,
-        private: privateMessage || false,
-        source_id: sourceId,
-        content_attributes: {
-          ...replyToIds,
-        },
-        source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
-      },
+      data: messageData,
     });
 
     if (!message) {
@@ -1082,11 +1138,12 @@ export class ChatwootService {
     if (messageBody && instance) {
       const replyToIds = await this.getReplyToIds(messageBody, instance);
 
-      if (replyToIds.in_reply_to || replyToIds.in_reply_to_external_id) {
-        const content = JSON.stringify({
-          ...replyToIds,
-        });
-        data.append('content_attributes', content);
+      // Filtra valores null/undefined antes de enviar
+      const filteredReplyToIds = Object.fromEntries(Object.entries(replyToIds).filter(([, value]) => value != null));
+
+      if (Object.keys(filteredReplyToIds).length > 0) {
+        const contentAttrs = JSON.stringify(filteredReplyToIds);
+        data.append('content_attributes', contentAttrs);
       }
     }
 
@@ -1204,7 +1261,7 @@ export class ChatwootService {
         const response = await axios.get(media, {
           responseType: 'arraybuffer',
         });
-        mimeType = response.headers['content-type'];
+        mimeType = String(response.headers['content-type']);
       }
 
       let type = 'document';
@@ -1464,6 +1521,52 @@ export class ChatwootService {
           formatText = textToConcat.join(formattedDelimiter);
         }
 
+        // Chatwoot interactive messages → WhatsApp interactive messages.
+        // (Private notes are already filtered upstream in receiveWebhook,
+        // so only public messages reach this point — no duplicates.)
+        const cwContentType = (body as any).content_type;
+        const cwItems = (body as any).content_attributes?.items;
+
+        // input_select → WhatsApp list (WhatsApp allows max 10 rows).
+        if (cwContentType === 'input_select' && Array.isArray(cwItems) && cwItems.length > 0) {
+          const rows = cwItems.slice(0, 10).map((item: any) => ({
+            title: String(item?.title || '').slice(0, 24),
+            description: String(item?.description || ''),
+            rowId: String(item?.value ?? item?.title ?? ''),
+          }));
+          await waInstance?.listMessage({
+            number: chatId,
+            title: (body as any).content_attributes?.title || i18next.t('cw.listMessage.options'),
+            description: messageReceived || '',
+            buttonText: (body as any).content_attributes?.button_text || i18next.t('cw.listMessage.select'),
+            sections: [
+              { title: (body as any).content_attributes?.section_title || i18next.t('cw.listMessage.options'), rows },
+            ],
+          } as any);
+          return { message: 'bot' };
+        }
+
+        // cards with postback actions → WhatsApp reply buttons (max 3).
+        if (cwContentType === 'cards' && Array.isArray(cwItems) && cwItems.length > 0) {
+          const replies = ((cwItems[0] as any)?.actions || [])
+            .filter((action: any) => action?.type === 'postback')
+            .slice(0, 3)
+            .map((action: any) => ({
+              type: 'reply',
+              id: String(action?.payload || action?.text || ''),
+              displayText: String(action?.text || '').slice(0, 20),
+            }));
+          if (replies.length > 0) {
+            await waInstance?.buttonMessage({
+              number: chatId,
+              title: messageReceived || '',
+              description: String((cwItems[0] as any)?.description || ''),
+              buttons: replies,
+            } as any);
+            return { message: 'bot' };
+          }
+        }
+
         for (const message of body.conversation.messages) {
           if (message.attachments && message.attachments.length > 0) {
             for (const attachment of message.attachments) {
@@ -1617,18 +1720,36 @@ export class ChatwootService {
       return;
     }
 
-    // Use raw SQL to avoid JSON path issues
-    const result = await this.prismaRepository.$executeRaw`
-      UPDATE "Message" 
-      SET 
-        "chatwootMessageId" = ${chatwootMessageIds.messageId},
-        "chatwootConversationId" = ${chatwootMessageIds.conversationId},
-        "chatwootInboxId" = ${chatwootMessageIds.inboxId},
-        "chatwootContactInboxSourceId" = ${chatwootMessageIds.contactInboxSourceId},
-        "chatwootIsRead" = ${chatwootMessageIds.isRead || false}
-      WHERE "instanceId" = ${instance.instanceId} 
-      AND "key"->>'id' = ${key.id}
-    `;
+    const provider = this.configService.get<Database>('DATABASE').PROVIDER;
+    let result: number;
+
+    if (provider === 'mysql') {
+      // MySQL version
+      result = await this.prismaRepository.$executeRaw`
+        UPDATE Message
+        SET
+          chatwootMessageId = ${chatwootMessageIds.messageId},
+          chatwootConversationId = ${chatwootMessageIds.conversationId},
+          chatwootInboxId = ${chatwootMessageIds.inboxId},
+          chatwootContactInboxSourceId = ${chatwootMessageIds.contactInboxSourceId},
+          chatwootIsRead = ${chatwootMessageIds.isRead || false}
+        WHERE instanceId = ${instance.instanceId}
+        AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${key.id}
+      `;
+    } else {
+      // PostgreSQL version
+      result = await this.prismaRepository.$executeRaw`
+        UPDATE "Message"
+        SET
+          "chatwootMessageId" = ${chatwootMessageIds.messageId},
+          "chatwootConversationId" = ${chatwootMessageIds.conversationId},
+          "chatwootInboxId" = ${chatwootMessageIds.inboxId},
+          "chatwootContactInboxSourceId" = ${chatwootMessageIds.contactInboxSourceId},
+          "chatwootIsRead" = ${chatwootMessageIds.isRead || false}
+        WHERE "instanceId" = ${instance.instanceId}
+        AND "key"->>'id' = ${key.id}
+      `;
+    }
 
     this.logger.verbose(`Update result: ${result} rows affected`);
 
@@ -1642,15 +1763,28 @@ export class ChatwootService {
   }
 
   private async getMessageByKeyId(instance: InstanceDto, keyId: string): Promise<MessageModel> {
-    // Use raw SQL query to avoid JSON path issues with Prisma
-    const messages = await this.prismaRepository.$queryRaw`
-      SELECT * FROM "Message" 
-      WHERE "instanceId" = ${instance.instanceId} 
-      AND "key"->>'id' = ${keyId}
-      LIMIT 1
-    `;
+    const provider = this.configService.get<Database>('DATABASE').PROVIDER;
+    let messages: MessageModel[];
 
-    return (messages as MessageModel[])[0] || null;
+    if (provider === 'mysql') {
+      // MySQL version
+      messages = await this.prismaRepository.$queryRaw`
+        SELECT * FROM Message
+        WHERE instanceId = ${instance.instanceId}
+        AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${keyId}
+        LIMIT 1
+      `;
+    } else {
+      // PostgreSQL version
+      messages = await this.prismaRepository.$queryRaw`
+        SELECT * FROM "Message"
+        WHERE "instanceId" = ${instance.instanceId}
+        AND "key"->>'id' = ${keyId}
+        LIMIT 1
+      `;
+    }
+
+    return messages[0] || null;
   }
 
   private async getReplyToIds(
@@ -1661,7 +1795,7 @@ export class ChatwootService {
     let inReplyToExternalId = null;
 
     if (msg) {
-      inReplyToExternalId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? msg.contextInfo?.stanzaId;
+      inReplyToExternalId = getReplyContext(msg.message, msg.contextInfo)?.stanzaId;
       if (inReplyToExternalId) {
         const message = await this.getMessageByKeyId(instance, inReplyToExternalId);
         if (message?.chatwootMessageId) {
@@ -1774,6 +1908,8 @@ export class ChatwootService {
       liveLocationMessage: msg.liveLocationMessage,
       listMessage: msg.listMessage,
       listResponseMessage: msg.listResponseMessage,
+      orderMessage: msg.orderMessage,
+      quotedProductMessage: msg.contextInfo?.quotedMessage?.productMessage,
       viewOnceMessageV2:
         msg?.message?.viewOnceMessageV2?.message?.imageMessage?.url ||
         msg?.message?.viewOnceMessageV2?.message?.videoMessage?.url ||
@@ -1788,9 +1924,93 @@ export class ChatwootService {
 
     let result = typeKey ? types[typeKey] : undefined;
 
-    // Remove externalAdReplyBody| in Chatwoot (Already Have)
+    // Remove externalAdReplyBody| in Chatwoot
     if (result && typeof result === 'string' && result.includes('externalAdReplyBody|')) {
       result = result.split('externalAdReplyBody|').filter(Boolean).join('');
+    }
+
+    // Tratamento de Pedidos do Catálogo (WhatsApp Business Catalog)
+    if (typeKey === 'orderMessage' && result.orderId) {
+      const now = Date.now();
+      // Limpa entradas antigas do cache
+      this.processedOrderIds.forEach((timestamp, id) => {
+        if (now - timestamp > this.ORDER_CACHE_TTL_MS) {
+          this.processedOrderIds.delete(id);
+        }
+      });
+      // Verifica se já processou este orderId
+      if (this.processedOrderIds.has(result.orderId)) {
+        return undefined; // Ignora duplicado
+      }
+      this.processedOrderIds.set(result.orderId, now);
+    }
+    // Tratamento de Produto citado (WhatsApp Desktop)
+    if (typeKey === 'quotedProductMessage' && result?.product) {
+      const product = result.product;
+
+      // Extrai preço
+      let rawPrice = 0;
+      const amount = product.priceAmount1000;
+
+      if (Long.isLong(amount)) {
+        rawPrice = amount.toNumber();
+      } else if (amount && typeof amount === 'object' && 'low' in amount) {
+        rawPrice = Long.fromValue(amount).toNumber();
+      } else if (typeof amount === 'number') {
+        rawPrice = amount;
+      }
+
+      const price = (rawPrice / 1000).toLocaleString('pt-BR', {
+        style: 'currency',
+        currency: product.currencyCode || 'BRL',
+      });
+
+      const productTitle = product.title || 'Produto do catálogo';
+      const productId = product.productId || 'N/A';
+
+      return (
+        `🛒 *PRODUTO DO CATÁLOGO (Desktop)*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `📦 *Produto:* ${productTitle}\n` +
+        `💰 *Preço:* ${price}\n` +
+        `🆔 *Código:* ${productId}\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `_Cliente perguntou: "${types.conversation || 'Me envia este produto?'}"_`
+      );
+    }
+    if (typeKey === 'orderMessage') {
+      // Extrai o valor - pode ser Long, objeto {low, high}, ou número direto
+      let rawPrice = 0;
+      const amount = result.totalAmount1000;
+
+      if (Long.isLong(amount)) {
+        rawPrice = amount.toNumber();
+      } else if (amount && typeof amount === 'object' && 'low' in amount) {
+        // Formato {low: number, high: number, unsigned: boolean}
+        rawPrice = Long.fromValue(amount).toNumber();
+      } else if (typeof amount === 'number') {
+        rawPrice = amount;
+      }
+
+      const price = (rawPrice / 1000).toLocaleString('pt-BR', {
+        style: 'currency',
+        currency: result.totalCurrencyCode || 'BRL',
+      });
+
+      const itemCount = result.itemCount || 1;
+      const orderTitle = result.orderTitle || 'Produto do catálogo';
+      const orderId = result.orderId || 'N/A';
+
+      return (
+        `🛒 *NOVO PEDIDO NO CATÁLOGO*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `📦 *Produto:* ${orderTitle}\n` +
+        `📊 *Quantidade:* ${itemCount}\n` +
+        `💰 *Total:* ${price}\n` +
+        `🆔 *Pedido:* #${orderId}\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `_Responda para atender este pedido!_`
+      );
     }
 
     if (typeKey === 'locationMessage' || typeKey === 'liveLocationMessage') {
@@ -1881,65 +2101,22 @@ export class ChatwootService {
     }
 
     if (typeKey === 'listMessage') {
-      const listTitle = result?.title || 'Unknown';
-      const listDescription = result?.description || 'Unknown';
-      const listFooter = result?.footerText || 'Unknown';
-
-      let formattedList =
-        '*List Menu:*\n\n' +
-        '_Title_: ' +
-        listTitle +
-        '\n' +
-        '_Description_: ' +
-        listDescription +
-        '\n' +
-        '_Footer_: ' +
-        listFooter;
-
-      if (result.sections && result.sections.length > 0) {
-        result.sections.forEach((section, sectionIndex) => {
-          formattedList += '\n\n*Section ' + (sectionIndex + 1) + ':* ' + section.title || 'Unknown\n';
-
-          if (section.rows && section.rows.length > 0) {
-            section.rows.forEach((row, rowIndex) => {
-              formattedList += '\n*Line ' + (rowIndex + 1) + ':*\n';
-              formattedList += '_▪️ Title:_ ' + (row.title || 'Unknown') + '\n';
-              formattedList += '_▪️ Description:_ ' + (row.description || 'Unknown') + '\n';
-              formattedList += '_▪️ ID:_ ' + (row.rowId || 'Unknown') + '\n';
-            });
-          } else {
-            formattedList += '\nNo lines found in this section.\n';
-          }
-        });
-      } else {
-        formattedList += '\nNo sections found.\n';
-      }
-
-      return formattedList;
+      return formatChatwootList(result, i18next.t);
     }
 
     if (typeKey === 'listResponseMessage') {
-      const responseTitle = result?.title || 'Unknown';
-      const responseDescription = result?.description || 'Unknown';
-      const responseRowId = result?.singleSelectReply?.selectedRowId || 'Unknown';
-
-      const formattedResponseList =
-        '*List Response:*\n\n' +
-        '_Title_: ' +
-        responseTitle +
-        '\n' +
-        '_Description_: ' +
-        responseDescription +
-        '\n' +
-        '_ID_: ' +
-        responseRowId;
-      return formattedResponseList;
+      return result?.title || result?.singleSelectReply?.selectedRowId || '';
     }
 
     return result;
   }
 
   public getConversationMessage(msg: any) {
+    if (msg?.listMessage) return formatChatwootList(msg.listMessage, i18next.t);
+
+    const interactiveReply = getInteractiveReply(msg);
+    if (interactiveReply) return interactiveReply.title;
+
     const types = this.getTypeMessage(msg);
 
     const messageContent = this.getMessageContent(types);
@@ -1993,6 +2170,29 @@ export class ChatwootService {
         }
       }
 
+      // CORREÇÃO LID: Resolve LID para número normal antes de processar evento
+      if (body?.key?.remoteJid && body.key.remoteJid.includes('@lid') && !body.key.remoteJid.endsWith('@g.us')) {
+        const originalJid = body.key.remoteJid;
+        const resolvedPhone = await this.resolveLidToPhone(instance, body.key);
+
+        if (resolvedPhone && resolvedPhone !== originalJid) {
+          this.logger.verbose(`Event LID resolved: ${originalJid} → ${resolvedPhone}`);
+          body.key.remoteJid = resolvedPhone;
+
+          // Salva mapeamento se temos remoteJidAlt
+          if (body.key.remoteJidAlt) {
+            this.saveLidMapping(originalJid, body.key.remoteJidAlt);
+          }
+        } else if (body.key.remoteJidAlt && !body.key.remoteJidAlt.includes('@lid')) {
+          // Se não resolveu mas tem remoteJidAlt válido, usa ele
+          this.logger.verbose(`Using remoteJidAlt for event: ${originalJid} → ${body.key.remoteJidAlt}`);
+          body.key.remoteJid = body.key.remoteJidAlt;
+          this.saveLidMapping(originalJid, body.key.remoteJidAlt);
+        } else {
+          this.logger.warn(`Could not resolve LID for event, keeping original: ${originalJid}`);
+        }
+      }
+
       if (event === 'messages.upsert' || event === 'send.message') {
         this.logger.info(`[${event}] New message received - Instance: ${JSON.stringify(body, null, 2)}`);
         if (body.key.remoteJid === 'status@broadcast') {
@@ -2006,24 +2206,30 @@ export class ChatwootService {
         }
 
         const originalMessage = await this.getConversationMessage(body.message);
-        const bodyMessage = originalMessage
-          ? originalMessage
-              .replaceAll(/\*((?!\s)([^\n*]+?)(?<!\s))\*/g, '**$1**')
-              .replaceAll(/_((?!\s)([^\n_]+?)(?<!\s))_/g, '*$1*')
-              .replaceAll(/~((?!\s)([^\n~]+?)(?<!\s))~/g, '~~$1~~')
-          : originalMessage;
+        // List messages carry machine-readable rowIds (e.g. send_activation_code)
+        // that WhatsApp→Chatwoot markdown conversion would corrupt
+        // (_activation_ → *activation*). Skip conversion for list payloads.
+        const isListPayload = !!getInteractiveReply(body.message) || body?.messageType === 'listMessage';
+        const bodyMessage =
+          originalMessage && !isListPayload
+            ? originalMessage
+                .replaceAll(/\*((?!\s)([^\n*]+?)(?<!\s))\*/g, '**$1**')
+                .replaceAll(/_((?!\s)([^\n_]+?)(?<!\s))_/g, '*$1*')
+                .replaceAll(/~((?!\s)([^\n~]+?)(?<!\s))~/g, '~~$1~~')
+            : originalMessage;
 
         if (bodyMessage && bodyMessage.includes('/survey/responses/') && bodyMessage.includes('http')) {
           return;
         }
 
-        const quotedId = body.contextInfo?.stanzaId || body.message?.contextInfo?.stanzaId;
+        const quotedId = getReplyContext(body.message, body.contextInfo)?.stanzaId;
 
         let quotedMsg = null;
 
         if (quotedId)
           quotedMsg = await this.prismaRepository.message.findFirst({
             where: {
+              instanceId: instance.instanceId,
               key: {
                 path: ['id'],
                 equals: quotedId,
@@ -2214,7 +2420,7 @@ export class ChatwootService {
         if (isAdsMessage) {
           const imgBuffer = await axios.get(adsMessage.thumbnailUrl, { responseType: 'arraybuffer' });
 
-          const extension = mimeTypes.extension(imgBuffer.headers['content-type']);
+          const extension = mimeTypes.extension(String(imgBuffer.headers['content-type']));
           const mimeType = extension && mimeTypes.lookup(extension);
 
           if (!mimeType) {
@@ -2535,6 +2741,82 @@ export class ChatwootService {
       return remoteJid;
     }
     return remoteJid.replace(/:\d+/, '').split('@')[0];
+  }
+
+  /**
+   * Limpa entradas antigas do cache de mapeamento LID
+   */
+  private cleanLidCache() {
+    const now = Date.now();
+    this.lidToPhoneMap.forEach((value, lid) => {
+      if (now - value.timestamp > this.LID_CACHE_TTL_MS) {
+        this.lidToPhoneMap.delete(lid);
+      }
+    });
+  }
+
+  /**
+   * Salva mapeamento LID → Número Normal
+   */
+  private saveLidMapping(lid: string, phoneNumber: string) {
+    if (!lid || !phoneNumber || !lid.includes('@lid')) {
+      return;
+    }
+
+    this.cleanLidCache();
+    this.lidToPhoneMap.set(lid, {
+      phone: phoneNumber,
+      timestamp: Date.now(),
+    });
+
+    this.logger.verbose(`LID mapping saved: ${lid} → ${phoneNumber}`);
+  }
+
+  /**
+   * Resolve LID para Número Normal
+   * Retorna o número normal se encontrado, ou o LID original se não encontrado
+   */
+  private async resolveLidToPhone(instance: InstanceDto, messageKey: any): Promise<string | null> {
+    const { remoteJid, remoteJidAlt } = messageKey;
+
+    // Se não for LID, retorna o próprio remoteJid
+    if (!remoteJid || !remoteJid.includes('@lid')) {
+      return remoteJid;
+    }
+
+    // 1. Tenta buscar no cache
+    const cached = this.lidToPhoneMap.get(remoteJid);
+    if (cached) {
+      this.logger.verbose(`LID resolved from cache: ${remoteJid} → ${cached.phone}`);
+      return cached.phone;
+    }
+
+    // 2. Se tem remoteJidAlt (número alternativo), usa ele e salva no cache
+    if (remoteJidAlt && !remoteJidAlt.includes('@lid')) {
+      this.saveLidMapping(remoteJid, remoteJidAlt);
+      this.logger.verbose(`LID resolved from remoteJidAlt: ${remoteJid} → ${remoteJidAlt}`);
+      return remoteJidAlt;
+    }
+
+    // 3. Tenta buscar no banco de dados do Chatwoot
+    try {
+      const lidIdentifier = this.normalizeJidIdentifier(remoteJid);
+      const contact = await this.findContactByIdentifier(instance, lidIdentifier);
+
+      if (contact && contact.phone_number) {
+        // Converte +554498860240 → 554498860240@s.whatsapp.net
+        const phoneNumber = contact.phone_number.replace('+', '') + '@s.whatsapp.net';
+        this.saveLidMapping(remoteJid, phoneNumber);
+        this.logger.verbose(`LID resolved from database: ${remoteJid} → ${phoneNumber}`);
+        return phoneNumber;
+      }
+    } catch (error) {
+      this.logger.warn(`Error resolving LID from database: ${error}`);
+    }
+
+    // 4. Se não encontrou, retorna null (será necessário criar novo contato)
+    this.logger.warn(`Could not resolve LID: ${remoteJid}`);
+    return null;
   }
 
   public startImportHistoryMessages(instance: InstanceDto) {

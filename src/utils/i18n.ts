@@ -3,7 +3,7 @@ import fs from 'fs';
 import i18next from 'i18next';
 import path from 'path';
 
-const languages = ['en', 'pt-BR', 'es'];
+const languages = ['en', 'ar'];
 const translationsPath = path.join(__dirname, 'translations');
 const configService: ConfigService = new ConfigService();
 
@@ -21,6 +21,7 @@ languages.forEach((language) => {
 
 i18next.init({
   resources,
+  supportedLngs: languages,
   fallbackLng: 'en',
   lng: configService.get<Language>('LANGUAGE'),
   debug: false,
