@@ -3,6 +3,8 @@ import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/d
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { getInteractiveReply, getReplyContext } from '@api/integrations/chatbot/chatwoot/utils/interactive-reply';
+import { formatChatwootList } from '@api/integrations/chatbot/chatwoot/utils/list-message';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -974,7 +976,14 @@ export class ChatwootService {
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
 
     // Filtra valores null/undefined do content_attributes para evitar erro 406
-    const filteredReplyToIds = Object.fromEntries(Object.entries(replyToIds).filter(([, value]) => value != null));
+    const filteredReplyToIds: Record<string, unknown> = Object.fromEntries(
+      Object.entries(replyToIds).filter(([, value]) => value != null),
+    );
+    const interactiveReply = getInteractiveReply(messageBody?.message);
+    if (interactiveReply) {
+      // Display the label, while preserving the exact selection for the Agent Bot.
+      filteredReplyToIds.interactive_reply = interactiveReply;
+    }
 
     // Monta o objeto data, incluindo content_attributes apenas se houver dados válidos
     const messageData: any = {
@@ -1527,10 +1536,12 @@ export class ChatwootService {
           }));
           await waInstance?.listMessage({
             number: chatId,
-            title: 'Options',
+            title: (body as any).content_attributes?.title || i18next.t('cw.listMessage.options'),
             description: messageReceived || '',
-            buttonText: 'Select an option',
-            sections: [{ title: 'Options', rows }],
+            buttonText: (body as any).content_attributes?.button_text || i18next.t('cw.listMessage.select'),
+            sections: [
+              { title: (body as any).content_attributes?.section_title || i18next.t('cw.listMessage.options'), rows },
+            ],
           } as any);
           return { message: 'bot' };
         }
@@ -1784,7 +1795,7 @@ export class ChatwootService {
     let inReplyToExternalId = null;
 
     if (msg) {
-      inReplyToExternalId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? msg.contextInfo?.stanzaId;
+      inReplyToExternalId = getReplyContext(msg.message, msg.contextInfo)?.stanzaId;
       if (inReplyToExternalId) {
         const message = await this.getMessageByKeyId(instance, inReplyToExternalId);
         if (message?.chatwootMessageId) {
@@ -2090,65 +2101,22 @@ export class ChatwootService {
     }
 
     if (typeKey === 'listMessage') {
-      const listTitle = result?.title || 'Unknown';
-      const listDescription = result?.description || 'Unknown';
-      const listFooter = result?.footerText || 'Unknown';
-
-      let formattedList =
-        '*List Menu:*\n\n' +
-        '_Title_: ' +
-        listTitle +
-        '\n' +
-        '_Description_: ' +
-        listDescription +
-        '\n' +
-        '_Footer_: ' +
-        listFooter;
-
-      if (result.sections && result.sections.length > 0) {
-        result.sections.forEach((section, sectionIndex) => {
-          formattedList += '\n\n*Section ' + (sectionIndex + 1) + ':* ' + section.title || 'Unknown\n';
-
-          if (section.rows && section.rows.length > 0) {
-            section.rows.forEach((row, rowIndex) => {
-              formattedList += '\n*Line ' + (rowIndex + 1) + ':*\n';
-              formattedList += '_▪️ Title:_ ' + (row.title || 'Unknown') + '\n';
-              formattedList += '_▪️ Description:_ ' + (row.description || 'Unknown') + '\n';
-              formattedList += '_▪️ ID:_ ' + (row.rowId || 'Unknown') + '\n';
-            });
-          } else {
-            formattedList += '\nNo lines found in this section.\n';
-          }
-        });
-      } else {
-        formattedList += '\nNo sections found.\n';
-      }
-
-      return formattedList;
+      return formatChatwootList(result, i18next.t);
     }
 
     if (typeKey === 'listResponseMessage') {
-      const responseTitle = result?.title || 'Unknown';
-      const responseDescription = result?.description || 'Unknown';
-      const responseRowId = result?.singleSelectReply?.selectedRowId || 'Unknown';
-
-      const formattedResponseList =
-        '*List Response:*\n\n' +
-        '_Title_: ' +
-        responseTitle +
-        '\n' +
-        '_Description_: ' +
-        responseDescription +
-        '\n' +
-        '_ID_: ' +
-        responseRowId;
-      return formattedResponseList;
+      return result?.title || result?.singleSelectReply?.selectedRowId || '';
     }
 
     return result;
   }
 
   public getConversationMessage(msg: any) {
+    if (msg?.listMessage) return formatChatwootList(msg.listMessage, i18next.t);
+
+    const interactiveReply = getInteractiveReply(msg);
+    if (interactiveReply) return interactiveReply.title;
+
     const types = this.getTypeMessage(msg);
 
     const messageContent = this.getMessageContent(types);
@@ -2241,7 +2209,7 @@ export class ChatwootService {
         // List messages carry machine-readable rowIds (e.g. send_activation_code)
         // that WhatsApp→Chatwoot markdown conversion would corrupt
         // (_activation_ → *activation*). Skip conversion for list payloads.
-        const isListPayload = body?.messageType === 'listResponseMessage' || body?.messageType === 'listMessage';
+        const isListPayload = !!getInteractiveReply(body.message) || body?.messageType === 'listMessage';
         const bodyMessage =
           originalMessage && !isListPayload
             ? originalMessage
@@ -2254,13 +2222,14 @@ export class ChatwootService {
           return;
         }
 
-        const quotedId = body.contextInfo?.stanzaId || body.message?.contextInfo?.stanzaId;
+        const quotedId = getReplyContext(body.message, body.contextInfo)?.stanzaId;
 
         let quotedMsg = null;
 
         if (quotedId)
           quotedMsg = await this.prismaRepository.message.findFirst({
             where: {
+              instanceId: instance.instanceId,
               key: {
                 path: ['id'],
                 equals: quotedId,
